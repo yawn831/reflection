@@ -7,6 +7,7 @@
 #include <iostream>
 #include <vector>
 #include <list>
+#include <cassert>
 
 struct Person final {
 	std::string familyName;
@@ -96,6 +97,215 @@ private:
 	Kind kind_;
 };
 
+class any;
+
+template <typename T>
+any make_copy(const T&);
+
+template <typename T>
+any make_steal(T&&);
+
+template <typename T>
+any make_ref(T&);
+
+template <typename T>
+any make_cref(const T&);
+
+class any final {
+public:
+	enum class storage_type {
+		Empty,
+		Copy,
+		Steal,
+		Ref,
+		ConstRef,
+	};
+
+	struct operations {
+		any(*copy) (const any&) = {}; // 函数指针
+		any(*steal) (any&) = {};
+		void(*release) (any&) = {};
+	};
+
+	any() = default;
+
+	any(const any& o) : typeinfo(o.typeinfo), store_type(o.store_type), ops(o.ops) {
+		if (ops.copy) {
+			auto new_any = ops.copy(o);
+			payload = new_any.payload;
+			new_any.payload = nullptr;
+			new_any.ops.release = nullptr;
+		}
+		else {
+			store_type = storage_type::Empty;
+			typeinfo = nullptr;
+		}
+	}
+
+	any(any&& o)
+		: typeinfo(std::move(o.typeinfo)), payload(std::move(o.payload)),
+		store_type(std::move(o.store_type)), ops(std::move(o.ops)) {}
+
+	any& operator = (const any& o) {
+		if (&o != this) {
+			typeinfo = o.typeinfo;
+			store_type = o.store_type;
+			ops = o.ops;
+			if (ops.copy) {
+				auto new_any = ops.copy(o);
+				payload = new_any.payload;
+				new_any.payload = nullptr;
+				new_any.ops.release = nullptr;
+			}
+			else {
+				store_type = storage_type::Empty;
+				typeinfo = nullptr;
+			}
+		}
+
+		return *this;
+	}
+
+	any& operator = (any&& o) {
+		if (&o != this) {
+			typeinfo = std::move(o.typeinfo);
+			store_type = std::move(o.store_type);
+			ops = std::move(o.ops);
+			payload = std::move(o.payload);
+		}
+		return *this;
+	}
+
+	~any() {
+		if (ops.release && (store_type == storage_type::Copy || store_type == storage_type::Steal)) {
+			ops.release(*this);
+		}
+	}
+
+
+	Type* typeinfo{};
+	void* payload{};
+	storage_type store_type = storage_type::Empty;
+	operations ops;
+};
+
+template <typename T>
+struct operations_traits {
+	static any copy(const any& elem) {
+		assert(elem.typeinfo == GetType<T>());
+
+		any return_value;
+		return_value.payload = new T{ *static_cast<T*>(elem.payload) };
+		return_value.typeinfo = elem.typeinfo;
+		return_value.store_type = any::storage_type::Copy;
+		return_value.ops = elem.ops;
+		return return_value;
+	}
+
+	static any steal(any& elem) {
+		assert(elem.typeinfo == GetType<T>());
+
+		any return_value;
+		return_value.payload = new T{ std::move(*static_cast<T*>(elem.payload)) };
+		return_value.typeinfo = elem.typeinfo;
+		return_value.store_type = any::storage_type::Copy;
+		elem.store_type = any::storage_type::Steal;
+		return_value.ops = elem.ops;
+		return return_value;
+	}
+
+	static void release(any& elem) {
+		assert(elem.typeinfo == GetType<T>());
+
+		delete (T*)(elem.payload);
+		elem.payload = nullptr;
+		elem.store_type = any::store_type::Empty;
+		elem.typeinfo = nullptr;
+	}
+};
+
+template <typename T>
+any make_copy(const T& elem) {
+	any return_value;
+	return_value.payload = new T{ elem };
+	return_value.typeinfo = GetType<T>();
+	return_value.store_type = any::storage_type::Copy;
+	if constexpr (std::is_copy_constructible_v<T>) {
+		return_value.ops.copy = &operations_traits<T>::copy;
+	}
+	if constexpr (std::is_move_constructible_v) {
+		return_value.ops.steal = &operations_traits<T>::steal;
+	}
+	if constexpr (std::is_destructible_v) {
+		return_value.ops.release = &operations_traits<T>::release;
+	}
+	return return_value;
+}
+
+template <typename T>
+any make_steal(T&& elem) {
+	any return_value;
+	return_value.payload = new T{ std::move(elem) };
+	return_value.typeinfo = GetType<T>();
+	return_value.store_type = any::storage_type::Steal;
+	if constexpr (std::is_copy_constructible_v<T>) {
+		return_value.ops.copy = &operations_traits<T>::copy;
+	}
+	if constexpr (std::is_move_constructible_v) {
+		return_value.ops.steal = &operations_traits<T>::steal;
+	}
+	if constexpr (std::is_destructible_v) {
+		return_value.ops.release = &operations_traits<T>::release;
+	}
+	return return_value;
+}
+
+template <typename T>
+any make_ref(T& elem) {
+	any return_value;
+	return_value.payload = &elem;
+	return_value.typeinfo = GetType<T>();
+	return_value.store_type = any::storage_type::Ref;
+	if constexpr (std::is_copy_constructible_v<T>) {
+		return_value.ops.copy = &operations_traits<T>::copy;
+	}
+	if constexpr (std::is_move_constructible_v) {
+		return_value.ops.steal = &operations_traits<T>::steal;
+	}
+	if constexpr (std::is_destructible_v) {
+		return_value.ops.release = &operations_traits<T>::release;
+	}
+	return return_value;
+}
+
+template <typename T>
+any make_cref(const T& elem) {
+	any return_value;
+	return_value.payload = &elem;
+	return_value.typeinfo = GetType<T>();
+	return_value.store_type = any::storage_type::ConstRef;
+	if constexpr (std::is_copy_constructible_v<T>) {
+		return_value.ops.copy = &operations_traits<T>::copy;
+	}
+	if constexpr (std::is_move_constructible_v) {
+		return_value.ops.steal = &operations_traits<T>::steal;
+	}
+	if constexpr (std::is_destructible_v) {
+		return_value.ops.release = &operations_traits<T>::release;
+	}
+	return return_value;
+}
+
+template <typename T>
+T* try_cast(any& elem) {
+	if (elem.typeinfo = GetType<T>()) {
+		return (T*)(elem.payload);
+	}
+	else {
+		return nullptr;
+	}
+}
+
 class Numeric : public Type {
 public:
 	enum class Kind {
@@ -113,6 +323,42 @@ public:
 
 	auto GetKind() const { return kind_; }
 	bool IsSinged() const { return isSinged_; }
+
+	void SetValue(double value, any& elem) {
+		if (elem.typeinfo->GetKind() == Type::Kind::Numeric) {
+			switch (elem.typeinfo->AsNumeric()->GetKind()) {
+			case Kind::Int8:
+				if (elem.typeinfo->AsNumeric()->IsSinged()) {
+					*(int8_t*)elem.payload = static_cast<int8_t>(value);
+				}
+				else {
+					*(uint8_t*)elem.payload = static_cast<uint8_t>(value);
+				}
+				break;
+			case Kind::Int16:
+				*(int16_t*)elem.payload = static_cast<int16_t>(value);
+				break;
+			case Kind::Int32:
+				*(int32_t*)elem.payload = static_cast<int32_t>(value);
+				break;
+			case Kind::Int64:
+				*(int64_t*)elem.payload = static_cast<int64_t>(value);
+				break;
+			case Kind::Float:
+				*(float*)elem.payload = static_cast<float>(value);
+				break;
+			case Kind::Double:
+				*(double*)elem.payload = value;
+				break;
+			case Kind::Unknow:
+				// 处理未知类型，最好是抛出异常或记录日志，而不是断言
+				throw std::runtime_error("Unknown numeric type");
+				break;
+			default:
+				assert(false);  // 处理意外情况
+			}
+		}
+	}
 
 	template <typename T>
 	static Numeric Create() {
@@ -190,18 +436,56 @@ private:
 	std::vector<Item> items_;
 };
 
-struct MerberVariable {
+class Member {
+public:
+	virtual any call(const std::vector<any>& anies) = 0;
+};
+
+template <typename Clazz, typename Type>
+struct MerberVariable : public Merber {
 	std::string name;
 	const Type* type;
+	Type Clazz::* ptr;
+
+	any call(const std::vector<any>& anies) override {
+		assert(anies.size() == 1 && anies[0].typeinfo == GetType<Clazz>());
+		Clazz* instance = (Clazz*)anies[0].payload;
+		auto value = instance->*ptr;
+		return make_copy(value);
+	}
 
 	template <typename T>
 	static MerberVariable Create(const std::string& name);
 };
 
-struct MerberFunction {
+template <typename T>
+T& unwrap(any& value) {
+	assert(value.typeinfo == GetType<T>());
+	return *(T*)value.payload;
+}
+
+template <typename Clazz, typename RetType, size_t... Idx, typename... Args>
+any inner_call(RetType(Clazz::* ptr)(Args...), const std::vector<any>& params, std::index_sequence<Idx...>) {
+	auto return_value =
+		((Clazz*)param[0].payload->*ptr)(unwrap<Args>(params[Idx + 1])...);
+	return make_copy(return_value);
+}
+
+template <typename Clazz, typename Type, typename... Args>
+struct MerberFunction : public Merber {
 	std::string name;
 	const Type* retType;
 	std::vector<const Type*> paramTypes;
+	RetType(Clazz::* ptr)(Args...);
+
+	any call(const std::vector<any>& anies) override {
+		assert(anies.size() == paramTypes.size() + 1);
+		for (int i = 0; i < paramTypes.size(); i++) {
+			assert(paramTypes[i] == anies[i + 1].typeinfo);
+		}
+
+		return inner_call(ptr, anies, std::make_index_sequence<sizeof...(Args)>());
+	}
 
 	template <typename T>
 	static MerberFunction Create(const std::string& name) {
@@ -378,6 +662,8 @@ MerberVariable MerberVariable::Create(const std::string& name) {
 	using type = typename variable_traits<T>::type;
 	return MerberVariable{ name, GetType<type>() };
 }
+
+
 
 int main() {
 	return 0;
